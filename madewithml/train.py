@@ -114,7 +114,7 @@ def train_model(
     cpu_per_worker: int = 1,
     gpu_per_worker: int = 0,
     num_samples: int = 100,
-    num_epochs: int = 10,
+    num_epochs: int = 1,
     batch_size: int = 8,
     results_fp: str = "results.json",
 ) -> Dict:
