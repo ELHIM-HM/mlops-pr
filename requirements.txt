@@ -8,12 +8,10 @@ numpy==1.26.3
 numpyencoder==0.3.0
 pandas==2.0.1
 python-dotenv==1.0.0
-ray[air]==2.7.0
 scikit-learn==1.2.2
 snorkel==0.9.9
 SQLAlchemy==1.4.48
 torch==2.0.0
-transformers==4.28.1
 
 # Notebook
 cleanlab==2.3.1
@@ -46,4 +44,3 @@ pre-commit==3.2.2
 typer==0.9.0
 
 # Deployment
-anyscale==0.5.131

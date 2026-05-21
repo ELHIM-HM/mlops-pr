@@ -4,10 +4,8 @@ from collections import OrderedDict
 from typing import Dict
 
 import numpy as np
-import ray
-import ray.train.torch  # NOQA: F401 (imported but unused)
+import pandas as pd
 import typer
-from ray.data import Dataset
 from sklearn.metrics import precision_recall_fscore_support
 from snorkel.slicing import PandasSFApplier, slicing_function
 from typing_extensions import Annotated
@@ -79,18 +77,17 @@ def short_text(x):  # pragma: no cover, eval workload
     return len(x.text.split()) < 8  # less than 8 words
 
 
-def get_slice_metrics(y_true: np.ndarray, y_pred: np.ndarray, ds: Dataset) -> Dict:  # pragma: no cover, eval workload
+def get_slice_metrics(y_true: np.ndarray, y_pred: np.ndarray, df: pd.DataFrame) -> Dict:  # pragma: no cover, eval workload
     """Get performance metrics for slices.
 
     Args:
         y_true (np.ndarray): ground truth labels.
         y_pred (np.ndarray): predicted labels.
-        ds (Dataset): Ray dataset with labels.
+        df (pd.DataFrame): dataframe with labels.
     Returns:
         Dict: performance metrics for slices.
     """
     slice_metrics = {}
-    df = ds.to_pandas()
     df["text"] = df["title"] + " " + df["description"]
     slices = PandasSFApplier([nlp_llm, short_text]).apply(df)
     for slice_name in slices.dtype.names:
@@ -122,19 +119,18 @@ def evaluate(
         Dict: model's performance metrics on the dataset.
     """
     # Load
-    ds = ray.data.read_csv(dataset_loc)
+    df = pd.read_csv(dataset_loc)
     best_checkpoint = predict.get_best_checkpoint(run_id=run_id)
     predictor = TorchPredictor.from_checkpoint(best_checkpoint)
 
     # y_true
     preprocessor = predictor.get_preprocessor()
-    preprocessed_ds = preprocessor.transform(ds)
-    values = preprocessed_ds.select_columns(cols=["targets"]).take_all()
-    y_true = np.stack([item["targets"] for item in values])
+    preprocessed_df = preprocessor.transform(df)
+    y_true = preprocessed_df["targets"].to_numpy()
 
     # y_pred
-    predictions = preprocessed_ds.map_batches(predictor).take_all()
-    y_pred = np.array([d["output"] for d in predictions])
+    predictions = predict.predict_proba(df=df, predictor=predictor)
+    y_pred = np.array([preprocessor.class_to_index[item["prediction"]] for item in predictions])
 
     # Metrics
     metrics = {
@@ -142,7 +138,7 @@ def evaluate(
         "run_id": run_id,
         "overall": get_overall_metrics(y_true=y_true, y_pred=y_pred),
         "per_class": get_per_class_metrics(y_true=y_true, y_pred=y_pred, class_to_index=preprocessor.class_to_index),
-        "slices": get_slice_metrics(y_true=y_true, y_pred=y_pred, ds=ds),
+        "slices": get_slice_metrics(y_true=y_true, y_pred=y_pred, df=df),
     }
     logger.info(json.dumps(metrics, indent=2))
     if results_fp:  # pragma: no cover, saving results

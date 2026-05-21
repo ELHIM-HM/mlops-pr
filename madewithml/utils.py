@@ -5,12 +5,8 @@ from typing import Any, Dict, List
 
 import numpy as np
 import torch
-from ray.data import DatasetContext
-from ray.train.torch import get_device
 
 from madewithml.config import mlflow
-
-DatasetContext.get_current().execution_options.preserve_order = True
 
 
 def set_seeds(seed: int = 42):
@@ -73,36 +69,39 @@ def pad_array(arr: np.ndarray, dtype=np.int32) -> np.ndarray:
     return padded_arr
 
 
-def collate_fn(batch: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:  # pragma: no cover, air internal
-    """Convert a batch of numpy arrays to tensors (with appropriate padding).
+def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:  # pragma: no cover, dataloader helper
+    """Convert a batch of records to tensors.
 
     Args:
-        batch (Dict[str, np.ndarray]): input batch as a dictionary of numpy arrays.
+        batch (List[Dict[str, Any]]): input batch as a list of records.
 
     Returns:
         Dict[str, torch.Tensor]: output batch as a dictionary of tensors.
     """
-    batch["ids"] = pad_array(batch["ids"])
-    batch["masks"] = pad_array(batch["masks"])
-    dtypes = {"ids": torch.int32, "masks": torch.int32, "targets": torch.int64}
-    tensor_batch = {}
-    for key, array in batch.items():
-        tensor_batch[key] = torch.as_tensor(array, dtype=dtypes[key], device=get_device())
+    features = np.stack([item["features"] for item in batch]).astype(np.float32)
+    tensor_batch = {"features": torch.as_tensor(features, dtype=torch.float32)}
+    if "targets" in batch[0]:
+        targets = np.array([item["targets"] for item in batch], dtype=np.int64)
+        tensor_batch["targets"] = torch.as_tensor(targets, dtype=torch.int64)
     return tensor_batch
 
 
-def get_run_id(experiment_name: str, trial_id: str) -> str:  # pragma: no cover, mlflow functionality
-    """Get the MLflow run ID for a specific Ray trial ID.
+def get_device() -> torch.device:
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def get_run_id(experiment_name: str, metric: str = "val_loss", mode: str = "ASC") -> str:  # pragma: no cover, mlflow functionality
+    """Get the MLflow run ID for the best run in an experiment.
 
     Args:
         experiment_name (str): name of the experiment.
-        trial_id (str): id of the trial.
+        metric (str): metric to sort by.
+        mode (str): direction of metric (ASC/DESC).
 
     Returns:
-        str: run id of the trial.
+        str: run id of the best run.
     """
-    trial_name = f"TorchTrainer_{trial_id}"
-    run = mlflow.search_runs(experiment_names=[experiment_name], filter_string=f"tags.trial_name = '{trial_name}'").iloc[0]
+    run = mlflow.search_runs(experiment_names=[experiment_name], order_by=[f"metrics.{metric} {mode}"]).iloc[0]
     return run.run_id
 
 

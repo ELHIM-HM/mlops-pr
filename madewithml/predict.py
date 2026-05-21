@@ -1,20 +1,16 @@
 import json
-from pathlib import Path
 from typing import Any, Dict, Iterable, List
-from urllib.parse import urlparse
-from urllib.request import url2pathname
 
 import numpy as np
-import ray
+import pandas as pd
+import torch
 import typer
 from numpyencoder import NumpyEncoder
-from ray.air import Result
-from ray.train.torch.torch_checkpoint import TorchCheckpoint
+from torch.utils.data import DataLoader
 from typing_extensions import Annotated
 
 from madewithml.config import logger, mlflow
-from madewithml.data import CustomPreprocessor
-from madewithml.models import FinetunedLLM
+from madewithml.data import CustomPreprocessor, TextDataset
 from madewithml.utils import collate_fn
 
 # Initialize Typer CLI app
@@ -51,17 +47,23 @@ def format_prob(prob: Iterable, index_to_class: Dict) -> Dict:
 
 
 class TorchPredictor:
-    def __init__(self, preprocessor, model):
+    def __init__(self, preprocessor, model, device=None):
         self.preprocessor = preprocessor
         self.model = model
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(self.device)
         self.model.eval()
 
     def __call__(self, batch):
-        results = self.model.predict(collate_fn(batch))
+        results = self.model.predict(batch)
         return {"output": results}
 
     def predict_proba(self, batch):
-        results = self.model.predict_proba(collate_fn(batch))
+        results = self.model.predict_proba(batch)
+        return {"output": results}
+
+    def predict(self, batch):
+        results = self.model.predict(batch)
         return {"output": results}
 
     def get_preprocessor(self):
@@ -69,15 +71,17 @@ class TorchPredictor:
 
     @classmethod
     def from_checkpoint(cls, checkpoint):
-        metadata = checkpoint.get_metadata()
-        preprocessor = CustomPreprocessor(class_to_index=metadata["class_to_index"])
-        model = FinetunedLLM.load(Path(checkpoint.path, "args.json"), Path(checkpoint.path, "model.pt"))
+        run_id = checkpoint
+        model = mlflow.pytorch.load_model(f"runs:/{run_id}/model")
+        preprocessor_path = mlflow.artifacts.download_artifacts(run_id=run_id, artifact_path="preprocessor/preprocessor.pkl")
+        preprocessor = CustomPreprocessor.load(preprocessor_path)
         return cls(preprocessor=preprocessor, model=model)
 
 
 def predict_proba(
-    ds: ray.data.dataset.Dataset,
+    df: pd.DataFrame,
     predictor: TorchPredictor,
+    batch_size: int = 64,
 ) -> List:  # pragma: no cover, tested with inference workload
     """Predict tags (with probabilities) for input data from a dataframe.
 
@@ -89,9 +93,15 @@ def predict_proba(
         List: list of predicted labels.
     """
     preprocessor = predictor.get_preprocessor()
-    preprocessed_ds = preprocessor.transform(ds)
-    outputs = preprocessed_ds.map_batches(predictor.predict_proba)
-    y_prob = np.array([d["output"] for d in outputs.take_all()])
+    preprocessed_df = preprocessor.transform(df)
+    dataset = TextDataset(preprocessed_df)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+    y_prob = []
+    for batch in loader:
+        batch = {key: value.to(predictor.device) for key, value in batch.items()}
+        outputs = predictor.predict_proba(batch)
+        y_prob.extend(outputs["output"])
+    y_prob = np.array(y_prob)
     results = []
     for i, prob in enumerate(y_prob):
         tag = preprocessor.index_to_class[prob.argmax()]
@@ -120,23 +130,16 @@ def get_best_run_id(experiment_name: str = "", metric: str = "", mode: str = "")
     return run_id
 
 
-def get_best_checkpoint(run_id: str) -> TorchCheckpoint:  # pragma: no cover, mlflow logic
+def get_best_checkpoint(run_id: str) -> str:  # pragma: no cover, mlflow logic
     """Get the best checkpoint from a specific run.
 
     Args:
         run_id (str): ID of the run to get the best checkpoint from.
 
     Returns:
-        TorchCheckpoint: Best checkpoint from the run.
+        str: run id to load model artifacts from.
     """
-    artifact_uri = mlflow.get_run(run_id).info.artifact_uri
-    parsed_uri = urlparse(artifact_uri)
-    if parsed_uri.scheme == "file":
-        artifact_dir = Path(url2pathname(parsed_uri.netloc + parsed_uri.path))
-    else:
-        artifact_dir = Path(artifact_uri)
-    results = Result.from_path(artifact_dir)
-    return results.best_checkpoints[0][0]
+    return run_id
 
 
 @app.command()
@@ -160,8 +163,8 @@ def predict(
     predictor = TorchPredictor.from_checkpoint(best_checkpoint)
 
     # Predict
-    sample_ds = ray.data.from_items([{"title": title, "description": description, "tag": "other"}])
-    results = predict_proba(ds=sample_ds, predictor=predictor)
+    sample_df = pd.DataFrame([{"title": title, "description": description, "tag": "other"}])
+    results = predict_proba(df=sample_df, predictor=predictor)
     logger.info(json.dumps(results, cls=NumpyEncoder, indent=2))
     return results
 

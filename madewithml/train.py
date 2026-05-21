@@ -1,33 +1,19 @@
 import datetime
 import json
-import os
 import tempfile
-from typing import Tuple
+from pathlib import Path
+from typing import Dict, Tuple
 
 import numpy as np
-import ray
-import ray.train as train
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import typer
-from ray.air.integrations.mlflow import MLflowLoggerCallback
-from ray.data import Dataset
-from ray.train import (
-    Checkpoint,
-    CheckpointConfig,
-    DataConfig,
-    RunConfig,
-    ScalingConfig,
-    SyncConfig,
-)
-from ray.train.torch import TorchTrainer
-from torch.nn.parallel.distributed import DistributedDataParallel
-from transformers import BertModel
+from torch.utils.data import DataLoader
 from typing_extensions import Annotated
 
 from madewithml import data, utils
-from madewithml.config import EFS_DIR, MLFLOW_TRACKING_URI, logger
+from madewithml.config import logger, mlflow
 from madewithml.models import FinetunedLLM
 
 # Initialize Typer CLI app
@@ -35,12 +21,12 @@ app = typer.Typer()
 
 
 def train_step(
-    ds: Dataset,
-    batch_size: int,
+    loader: DataLoader,
     model: nn.Module,
     num_classes: int,
     loss_fn: torch.nn.modules.loss._WeightedLoss,
     optimizer: torch.optim.Optimizer,
+    device: torch.device,
 ) -> float:  # pragma: no cover, tested via train workload
     """Train step.
 
@@ -57,8 +43,8 @@ def train_step(
     """
     model.train()
     loss = 0.0
-    ds_generator = ds.iter_torch_batches(batch_size=batch_size, collate_fn=utils.collate_fn)
-    for i, batch in enumerate(ds_generator):
+    for i, batch in enumerate(loader):
+        batch = {key: value.to(device) for key, value in batch.items()}
         optimizer.zero_grad()  # reset gradients
         z = model(batch)  # forward pass
         targets = F.one_hot(batch["targets"], num_classes=num_classes).float()  # one-hot (for loss_fn)
@@ -70,7 +56,11 @@ def train_step(
 
 
 def eval_step(
-    ds: Dataset, batch_size: int, model: nn.Module, num_classes: int, loss_fn: torch.nn.modules.loss._WeightedLoss
+    loader: DataLoader,
+    model: nn.Module,
+    num_classes: int,
+    loss_fn: torch.nn.modules.loss._WeightedLoss,
+    device: torch.device,
 ) -> Tuple[float, np.array, np.array]:  # pragma: no cover, tested via train workload
     """Eval step.
 
@@ -87,9 +77,9 @@ def eval_step(
     model.eval()
     loss = 0.0
     y_trues, y_preds = [], []
-    ds_generator = ds.iter_torch_batches(batch_size=batch_size, collate_fn=utils.collate_fn)
     with torch.inference_mode():
-        for i, batch in enumerate(ds_generator):
+        for i, batch in enumerate(loader):
+            batch = {key: value.to(device) for key, value in batch.items()}
             z = model(batch)
             targets = F.one_hot(batch["targets"], num_classes=num_classes).float()  # one-hot (for loss_fn)
             J = loss_fn(z, targets).item()
@@ -100,53 +90,19 @@ def eval_step(
 
 
 def train_loop_per_worker(config: dict) -> None:  # pragma: no cover, tested via train workload
-    """Training loop that each worker will execute.
-
-    Args:
-        config (dict): arguments to use for training.
-    """
-    # Hyperparameters
-    dropout_p = config["dropout_p"]
-    lr = config["lr"]
-    lr_factor = config["lr_factor"]
-    lr_patience = config["lr_patience"]
-    num_epochs = config["num_epochs"]
-    batch_size = config["batch_size"]
-    num_classes = config["num_classes"]
-
-    # Get datasets
-    utils.set_seeds()
-    train_ds = train.get_dataset_shard("train")
-    val_ds = train.get_dataset_shard("val")
-
-    # Model
-    llm = BertModel.from_pretrained("allenai/scibert_scivocab_uncased", return_dict=False)
-    model = FinetunedLLM(llm=llm, dropout_p=dropout_p, embedding_dim=llm.config.hidden_size, num_classes=num_classes)
-    model = train.torch.prepare_model(model)
-
-    # Training components
-    loss_fn = nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=lr_factor, patience=lr_patience)
-
-    # Training
-    num_workers = train.get_context().get_world_size()
-    batch_size_per_worker = batch_size // num_workers
-    for epoch in range(num_epochs):
-        # Step
-        train_loss = train_step(train_ds, batch_size_per_worker, model, num_classes, loss_fn, optimizer)
-        val_loss, _, _ = eval_step(val_ds, batch_size_per_worker, model, num_classes, loss_fn)
-        scheduler.step(val_loss)
-
-        # Checkpoint
-        with tempfile.TemporaryDirectory() as dp:
-            if isinstance(model, DistributedDataParallel):  # cpu
-                model.module.save(dp=dp)
-            else:
-                model.save(dp=dp)
-            metrics = dict(epoch=epoch, lr=optimizer.param_groups[0]["lr"], train_loss=train_loss, val_loss=val_loss)
-            checkpoint = Checkpoint.from_directory(dp)
-            train.report(metrics, checkpoint=checkpoint)
+    """Compatibility wrapper for legacy entrypoints."""
+    train_model(
+        experiment_name=config.get("experiment_name", "mlops-project"),
+        dataset_loc=config.get("dataset_loc", "datasets/dataset.csv"),
+        train_loop_config=json.dumps(config.get("train_loop_config", {})),
+        num_workers=config.get("num_workers", 1),
+        cpu_per_worker=config.get("cpu_per_worker", 1),
+        gpu_per_worker=config.get("gpu_per_worker", 0),
+        num_samples=config.get("num_samples", 100),
+        num_epochs=config.get("num_epochs", 10),
+        batch_size=config.get("batch_size", 8),
+        results_fp=config.get("results_fp", "results.json"),
+    )
 
 
 @app.command()
@@ -161,8 +117,8 @@ def train_model(
     num_epochs: int = 10,
     batch_size: int = 8,
     results_fp: str = "results.json",
-) -> ray.air.result.Result:
-    """Main train function to train our model as a distributed workload.
+) -> Dict:
+    """Main train function to train our model.
 
     Args:
         experiment_name (str): name of the experiment for this training workload.
@@ -180,7 +136,7 @@ def train_model(
         results_fp (str, optional): filepath to save results to. Defaults to None.
 
     Returns:
-        ray.air.result.Result: training results.
+        Dict: training results.
     """
     # Set up
     train_loop_config = json.loads(train_loop_config)
@@ -188,80 +144,88 @@ def train_model(
     train_loop_config["num_epochs"] = num_epochs
     train_loop_config["batch_size"] = batch_size
 
-    # Scaling config
-    scaling_config = ScalingConfig(
-        num_workers=num_workers,
-        use_gpu=bool(gpu_per_worker),
-        resources_per_worker={"CPU": cpu_per_worker, "GPU": gpu_per_worker},
-    )
-
-    # Checkpoint config
-    checkpoint_config = CheckpointConfig(
-        num_to_keep=1,
-        checkpoint_score_attribute="val_loss",
-        checkpoint_score_order="min",
-    )
-
-    # MLflow callback
-    mlflow_callback = MLflowLoggerCallback(
-        tracking_uri=MLFLOW_TRACKING_URI,
-        experiment_name=experiment_name,
-        save_artifact=True,
-    )
-
-    # Run config
-    run_config = RunConfig(
-        callbacks=[mlflow_callback],
-        checkpoint_config=checkpoint_config,
-        local_dir=str(EFS_DIR),
-        sync_config=SyncConfig(syncer=None),
-    )
-
     # Dataset
     ds = data.load_data(dataset_loc=dataset_loc, num_samples=train_loop_config["num_samples"])
     train_ds, val_ds = data.stratify_split(ds, stratify="tag", test_size=0.2)
-    tags = train_ds.unique(column="tag")
+    tags = train_ds["tag"].unique()
     train_loop_config["num_classes"] = len(tags)
-
-    # Dataset config
-    options = ray.data.ExecutionOptions(preserve_order=True)
-    dataset_config = DataConfig(datasets_to_split=["train"], execution_options=options)
 
     # Preprocess
     preprocessor = data.CustomPreprocessor()
     preprocessor = preprocessor.fit(train_ds)
     train_ds = preprocessor.transform(train_ds)
     val_ds = preprocessor.transform(val_ds)
-    train_ds = train_ds.materialize()
-    val_ds = val_ds.materialize()
 
-    # Trainer
-    trainer = TorchTrainer(
-        train_loop_per_worker=train_loop_per_worker,
-        train_loop_config=train_loop_config,
-        scaling_config=scaling_config,
-        run_config=run_config,
-        datasets={"train": train_ds, "val": val_ds},
-        dataset_config=dataset_config,
-        metadata={"class_to_index": preprocessor.class_to_index},
+    train_dataset = data.TextDataset(train_ds)
+    val_dataset = data.TextDataset(val_ds)
+
+    input_dim = len(preprocessor.vectorizer.get_feature_names_out())
+    model = FinetunedLLM(
+        input_dim=input_dim,
+        num_classes=train_loop_config["num_classes"],
+        dropout_p=train_loop_config["dropout_p"],
+    )
+    device = utils.get_device()
+    model = model.to(device)
+
+    loss_fn = nn.BCEWithLogitsLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=train_loop_config["lr"])
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=train_loop_config["lr_factor"],
+        patience=train_loop_config["lr_patience"],
     )
 
-    # Train
-    results = trainer.fit()
-    d = {
-        "timestamp": datetime.datetime.now().strftime("%B %d, %Y %I:%M:%S %p"),
-        "run_id": utils.get_run_id(experiment_name=experiment_name, trial_id=results.metrics["trial_id"]),
-        "params": results.config["train_loop_config"],
-        "metrics": utils.dict_to_list(results.metrics_dataframe.to_dict(), keys=["epoch", "train_loss", "val_loss"]),
-    }
-    logger.info(json.dumps(d, indent=2))
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=utils.collate_fn)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=utils.collate_fn)
+
+    history = []
+    best_val_loss = float("inf")
+
+    mlflow.set_experiment(experiment_name)
+    run_name = f"{experiment_name}-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    with mlflow.start_run(run_name=run_name) as run:
+        mlflow.log_params(train_loop_config)
+        mlflow.log_param("dataset_loc", dataset_loc)
+
+        for epoch in range(num_epochs):
+            train_loss = train_step(train_loader, model, train_loop_config["num_classes"], loss_fn, optimizer, device)
+            val_loss, _, _ = eval_step(val_loader, model, train_loop_config["num_classes"], loss_fn, device)
+            scheduler.step(val_loss)
+
+            metrics = {
+                "epoch": epoch,
+                "lr": optimizer.param_groups[0]["lr"],
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+            }
+            history.append(metrics)
+            mlflow.log_metrics(metrics, step=epoch)
+
+            if val_loss <= best_val_loss:
+                best_val_loss = val_loss
+
+        mlflow.pytorch.log_model(model, artifact_path="model")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            preprocessor_path = Path(tmp_dir, "preprocessor.pkl")
+            preprocessor.save(str(preprocessor_path))
+            mlflow.log_artifact(str(preprocessor_path), artifact_path="preprocessor")
+
+        results = {
+            "timestamp": datetime.datetime.now().strftime("%B %d, %Y %I:%M:%S %p"),
+            "run_id": run.info.run_id,
+            "params": train_loop_config,
+            "best_val_loss": best_val_loss,
+            "metrics": history,
+        }
+
+    logger.info(json.dumps(results, indent=2))
     if results_fp:  # pragma: no cover, saving results
-        utils.save_dict(d, results_fp)
+        utils.save_dict(results, results_fp)
     return results
 
 
 if __name__ == "__main__":  # pragma: no cover, application
-    if ray.is_initialized():
-        ray.shutdown()
-    ray.init(num_gpus=0, runtime_env={"env_vars": {"GITHUB_USERNAME": os.environ["GITHUB_USERNAME"]}})
     app()
