@@ -47,10 +47,10 @@ pipeline {
         stage("Train") {
             steps {
                 sh "${env.VENV_PY} -m madewithml.train --experiment-name mlops-project --num-epochs 1 --results-fp results.json"
-                
-                // Using Python to parse the JSON natively since we are in a Python container
-                sh "${env.VENV_PY} -c \"import json; print(json.load(open('results.json'))['run_id'])\" > run_id.txt"
-                
+
+                // Read run_id from MLflow after training
+                sh "${env.VENV_PY} -c \"from madewithml.config import MLFLOW_TRACKING_URI, mlflow; mlflow.set_tracking_uri(MLFLOW_TRACKING_URI); runs = mlflow.search_runs(experiment_names=['mlops-project'], order_by=['metrics.val_loss ASC']); print(runs.iloc[0].run_id)\" > run_id.txt"
+
                 script {
                     env.RUN_ID = readFile('run_id.txt').trim()
                 }
