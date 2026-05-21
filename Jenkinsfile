@@ -8,6 +8,7 @@ pipeline {
     environment {
         PYTHON_EXE = "C:\\\\Users\\\\hamza\\\\.pyenv\\\\pyenv-win\\\\versions\\\\3.10.0\\\\python.exe"
         VENV_DIR = ".venv"
+            VENV_PY = ".\\.venv\\Scripts\\python.exe"
         RUN_ID = ""
     }
 
@@ -20,24 +21,24 @@ pipeline {
 
         stage("Setup") {
             steps {
-                powershell "& ${env.PYTHON_EXE} -m venv ${env.VENV_DIR}"
-                powershell "& .\\${env.VENV_DIR}\\Scripts\\Activate.ps1; & ${env.PYTHON_EXE} -m pip install --upgrade pip"
-                powershell "& .\\${env.VENV_DIR}\\Scripts\\Activate.ps1; pip install -r requirements.txt"
+                    powershell "& ${env.PYTHON_EXE} -m venv ${env.VENV_DIR}"
+                    powershell "& ${env.VENV_PY} -m pip install --upgrade pip"
+                    powershell "& ${env.VENV_PY} -m pip install -r requirements.txt"
             }
         }
 
         stage("Tests") {
             steps {
-                powershell "if ((Test-Path tests) -or (Test-Path pytest.ini) -or (Test-Path pyproject.toml)) { & .\\${env.VENV_DIR}\\Scripts\\Activate.ps1; pytest -q } else { Write-Host 'No tests found, skipping.' }"
+                    powershell "if ((Test-Path tests) -or (Test-Path pytest.ini) -or (Test-Path pyproject.toml)) { & ${env.VENV_PY} -m pytest -q } else { Write-Host 'No tests found, skipping.' }"
             }
         }
 
         stage("Train") {
             steps {
-                powershell "& .\\${env.VENV_DIR}\\Scripts\\Activate.ps1; & ${env.PYTHON_EXE} -m madewithml.train --experiment-name mlops-project --num-epochs 1 --results-fp results.json"
+                    powershell "& ${env.VENV_PY} -m madewithml.train --experiment-name mlops-project --num-epochs 1 --results-fp results.json"
                 script {
                     env.RUN_ID = powershell(
-                        script: "& .\\${env.VENV_DIR}\\Scripts\\Activate.ps1; (Get-Content results.json | ConvertFrom-Json).run_id",
+                            script: "(Get-Content results.json | ConvertFrom-Json).run_id",
                         returnStdout: true
                     ).trim()
                 }
@@ -47,14 +48,14 @@ pipeline {
 
         stage("Evaluate") {
             steps {
-                powershell "& .\\${env.VENV_DIR}\\Scripts\\Activate.ps1; & ${env.PYTHON_EXE} -m madewithml.evaluate --run-id ${env.RUN_ID} --dataset-loc datasets/holdout.csv --results-fp eval-results.json"
+                    powershell "& ${env.VENV_PY} -m madewithml.evaluate --run-id ${env.RUN_ID} --dataset-loc datasets/holdout.csv --results-fp eval-results.json"
             }
         }
 
         stage("Serve") {
             steps {
                 powershell '''
-                    $proc = Start-Process -FilePath $env:PYTHON_EXE -ArgumentList "-m madewithml.serve --run_id $env:RUN_ID --host 127.0.0.1 --port 8000" -PassThru
+                        $proc = Start-Process -FilePath $env:VENV_PY -ArgumentList "-m madewithml.serve --run_id $env:RUN_ID --host 127.0.0.1 --port 8000" -PassThru
                     Start-Sleep -Seconds 3
                     Invoke-WebRequest -Uri "http://127.0.0.1:8000/" -UseBasicParsing | Select-Object -ExpandProperty Content
                     Stop-Process -Id $proc.Id -Force
