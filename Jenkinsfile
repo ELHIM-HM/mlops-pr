@@ -1,15 +1,19 @@
 pipeline {
-    agent any
+    // This tells Jenkins to pull the official Python 3.10 image and run all steps inside it!
+    agent {
+        docker {
+            image 'python:3.10.0-slim'
+        }
+    }
 
     options {
         timestamps()
     }
 
     environment {
-        // Defines the global python executable and project environment paths
-        PYTHON_EXE = "C:\\\\Users\\\\hamza\\\\.pyenv\\\\pyenv-win\\\\versions\\\\3.10.0\\\\python.exe"
+        // Standard Linux paths now!
         VENV_DIR = ".venv"
-        VENV_PY = ".\\.venv\\Scripts\\python.exe"
+        VENV_PY = ".venv/bin/python" 
         RUN_ID = ""
     }
 
@@ -22,51 +26,59 @@ pipeline {
 
         stage("Setup") {
             steps {
-                powershell "& ${env.PYTHON_EXE} -m venv ${env.VENV_DIR}"
-                powershell "& ${env.VENV_PY} -m pip install --upgrade pip"
-                powershell "& ${env.VENV_PY} -m pip install -r requirements.txt"
+                sh "python -m venv ${env.VENV_DIR}"
+                sh "${env.VENV_PY} -m pip install --upgrade pip"
+                sh "${env.VENV_PY} -m pip install -r requirements.txt"
             }
         }
 
         stage("Tests") {
             steps {
-                powershell "if ((Test-Path tests) -or (Test-Path pytest.ini) -or (Test-Path pyproject.toml)) { & ${env.VENV_PY} -m pytest -q } else { Write-Host 'No tests found, skipping.' }"
+                sh '''
+                    if [ -d "tests" ] || [ -f "pytest.ini" ] || [ -f "pyproject.toml" ]; then
+                        ${VENV_PY} -m pytest -q
+                    else
+                        echo "No tests found, skipping."
+                    fi
+                '''
             }
         }
 
         stage("Train") {
             steps {
-                // 1. Run the training script (this generates results.json)
-                powershell "& ${env.VENV_PY} -m madewithml.train --experiment-name mlops-project --num-epochs 1 --results-fp results.json"
+                sh "${env.VENV_PY} -m madewithml.train --experiment-name mlops-project --num-epochs 1 --results-fp results.json"
                 
-                // 2. Use PowerShell to extract the run_id from the JSON and save it to a temporary text file
-                powershell "(Get-Content results.json | ConvertFrom-Json).run_id | Out-File -FilePath run_id.txt -Encoding ASCII"
+                // Using Python to parse the JSON natively since we are in a Python container
+                sh "${env.VENV_PY} -c \"import json; print(json.load(open('results.json'))['run_id'])\" > run_id.txt"
                 
-                // 3. Read the text file into the Jenkins environment variable
                 script {
                     env.RUN_ID = readFile('run_id.txt').trim()
                 }
-                
-                // 4. Verify it worked!
                 echo "Successfully captured run_id: ${env.RUN_ID}"
             }
         }
 
         stage("Evaluate") {
             steps {
-                powershell "& ${env.VENV_PY} -m madewithml.evaluate --run-id ${env.RUN_ID} --dataset-loc datasets/holdout.csv --results-fp eval-results.json"
+                sh "${env.VENV_PY} -m madewithml.evaluate --run-id ${env.RUN_ID} --dataset-loc datasets/holdout.csv --results-fp eval-results.json"
             }
         }
 
         stage("Serve") {
             steps {
-                // Using single quotes (''') prevents Groovy from evaluating $proc as a variable, 
-                // allowing PowerShell to handle $env:RUN_ID and $env:VENV_PY natively.
-                powershell '''
-                    $proc = Start-Process -FilePath $env:VENV_PY -ArgumentList "-m madewithml.serve --run_id $env:RUN_ID --host 127.0.0.1 --port 8000" -PassThru
-                    Start-Sleep -Seconds 3
-                    Invoke-WebRequest -Uri "http://127.0.0.1:8000/" -UseBasicParsing | Select-Object -ExpandProperty Content
-                    Stop-Process -Id $proc.Id -Force
+                sh '''
+                    # Start the server in the background (&)
+                    ${VENV_PY} -m madewithml.serve --run_id ${RUN_ID} --host 127.0.0.1 --port 8000 &
+                    SERVER_PID=$!
+                    
+                    # Wait for it to boot up
+                    sleep 5
+                    
+                    # Use Python's built-in urllib to test the endpoint (replaces Invoke-WebRequest)
+                    ${VENV_PY} -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8000/').read().decode('utf-8'))"
+                    
+                    # Kill the background process
+                    kill $SERVER_PID
                 '''
             }
         }
