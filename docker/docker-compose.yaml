@@ -1,0 +1,15 @@
+services:
+  jenkins:
+    build: .
+    container_name: jenkins-mlops
+    user: root # Required to read the host's docker.sock
+    ports:
+      - "8090:8080"
+      - "50000:50000"
+    volumes:
+      - jenkins_data:/var/jenkins_home
+      # Mount the Docker socket so Jenkins can spin up the Python agent
+      - /var/run/docker.sock:/var/run/docker.sock
+
+volumes:
+  jenkins_data:
