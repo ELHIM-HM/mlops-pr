@@ -1,7 +1,7 @@
 
 services:
   jenkins:
-    build: 
+    build:
       context: .
       dockerfile: jn.Dockerfile
     container_name: jenkins-mlops
@@ -13,11 +13,14 @@ services:
       - jenkins_data:/var/jenkins_home
       # Mount the Docker socket so Jenkins can spin up the Python agent
       - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - mlops-net
+
   hugging-face-serve:
     profiles:
       - serve
     build:
-      context: ..
+      context: .
       dockerfile: Dockerfile
     image: ${DOCKER_IMAGE:-hugging-face-classifier:monitoring}
     shm_size: 3g
@@ -54,10 +57,10 @@ services:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
     command:
-          - ../monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-          - "--storage.tsdb.path=/prometheus"
-          - "--web.console.libraries=/usr/share/prometheus/console_libraries"
-          - "--web.console.templates=/usr/share/prometheus/consoles"
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
     restart: unless-stopped
     networks:
       - mlops-net
@@ -73,9 +76,9 @@ services:
     volumes:
       - grafana_data:/var/lib/grafana
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
-          - ../grafana_data:/var/lib/grafana
-          - ../monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
-          - ../monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
     restart: unless-stopped
     networks:
       - mlops-net
@@ -86,6 +89,7 @@ volumes:
     name: hugging_face_classifier_storage
   hf_cache:
   prometheus_data:
+  grafana_data:
 
 networks:
   mlops-net:
