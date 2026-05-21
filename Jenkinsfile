@@ -38,11 +38,21 @@ pipeline {
                     powershell "& ${env.VENV_PY} -m madewithml.train --experiment-name mlops-project --num-epochs 1 --results-fp results.json"
                 script {
                     env.RUN_ID = powershell(
-                            script: '''
-                                $resultsPath = Join-Path $env:WORKSPACE 'results.json'
-                                if (!(Test-Path $resultsPath)) { throw 'results.json not found' }
-                                (Get-Content -Raw $resultsPath | ConvertFrom-Json).run_id
-                            ''',
+                        script: '''
+                            $resultsPath = Join-Path $env:WORKSPACE 'results.json'
+                            if (!(Test-Path $resultsPath)) { throw 'results.json not found' }
+                            & $env:VENV_PY - <<'PY'
+import json
+import sys
+with open('results.json', 'r', encoding='utf-8') as fp:
+    data = json.load(fp)
+run_id = data.get('run_id')
+if not run_id:
+    print('')
+    sys.exit(1)
+print(run_id)
+PY
+                        ''',
                         returnStdout: true
                     ).trim()
                 }
