@@ -6,9 +6,10 @@ pipeline {
     }
 
     environment {
+        // Defines the global python executable and project environment paths
         PYTHON_EXE = "C:\\\\Users\\\\hamza\\\\.pyenv\\\\pyenv-win\\\\versions\\\\3.10.0\\\\python.exe"
         VENV_DIR = ".venv"
-            VENV_PY = ".\\.venv\\Scripts\\python.exe"
+        VENV_PY = ".\\.venv\\Scripts\\python.exe"
         RUN_ID = ""
     }
 
@@ -21,36 +22,48 @@ pipeline {
 
         stage("Setup") {
             steps {
-                    powershell "& ${env.PYTHON_EXE} -m venv ${env.VENV_DIR}"
-                    powershell "& ${env.VENV_PY} -m pip install --upgrade pip"
-                    powershell "& ${env.VENV_PY} -m pip install -r requirements.txt"
+                powershell "& ${env.PYTHON_EXE} -m venv ${env.VENV_DIR}"
+                powershell "& ${env.VENV_PY} -m pip install --upgrade pip"
+                powershell "& ${env.VENV_PY} -m pip install -r requirements.txt"
             }
         }
 
         stage("Tests") {
             steps {
-                    powershell "if ((Test-Path tests) -or (Test-Path pytest.ini) -or (Test-Path pyproject.toml)) { & ${env.VENV_PY} -m pytest -q } else { Write-Host 'No tests found, skipping.' }"
+                powershell "if ((Test-Path tests) -or (Test-Path pytest.ini) -or (Test-Path pyproject.toml)) { & ${env.VENV_PY} -m pytest -q } else { Write-Host 'No tests found, skipping.' }"
             }
         }
 
         stage("Train") {
             steps {
-                    powershell "& ${env.VENV_PY} -m madewithml.train --experiment-name mlops-project --num-epochs 1 --results-fp results.json"
+                // 1. Run the training script (this generates results.json)
+                powershell "& ${env.VENV_PY} -m madewithml.train --experiment-name mlops-project --num-epochs 1 --results-fp results.json"
                 
-                echo "Using run_id: ${env.RUN_ID}"
+                // 2. Use PowerShell to extract the run_id from the JSON and save it to a temporary text file
+                powershell "(Get-Content results.json | ConvertFrom-Json).run_id | Out-File -FilePath run_id.txt -Encoding ASCII"
+                
+                // 3. Read the text file into the Jenkins environment variable
+                script {
+                    env.RUN_ID = readFile('run_id.txt').trim()
+                }
+                
+                // 4. Verify it worked!
+                echo "Successfully captured run_id: ${env.RUN_ID}"
             }
         }
 
         stage("Evaluate") {
             steps {
-                    powershell "& ${env.VENV_PY} -m madewithml.evaluate --run-id ${env.RUN_ID} --dataset-loc datasets/holdout.csv --results-fp eval-results.json"
+                powershell "& ${env.VENV_PY} -m madewithml.evaluate --run-id ${env.RUN_ID} --dataset-loc datasets/holdout.csv --results-fp eval-results.json"
             }
         }
 
         stage("Serve") {
             steps {
+                // Using single quotes (''') prevents Groovy from evaluating $proc as a variable, 
+                // allowing PowerShell to handle $env:RUN_ID and $env:VENV_PY natively.
                 powershell '''
-                        $proc = Start-Process -FilePath $env:VENV_PY -ArgumentList "-m madewithml.serve --run_id $env:RUN_ID --host 127.0.0.1 --port 8000" -PassThru
+                    $proc = Start-Process -FilePath $env:VENV_PY -ArgumentList "-m madewithml.serve --run_id $env:RUN_ID --host 127.0.0.1 --port 8000" -PassThru
                     Start-Sleep -Seconds 3
                     Invoke-WebRequest -Uri "http://127.0.0.1:8000/" -UseBasicParsing | Select-Object -ExpandProperty Content
                     Stop-Process -Id $proc.Id -Force
@@ -67,4 +80,3 @@ pipeline {
         }
     }
 }
-
